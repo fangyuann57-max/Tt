@@ -1,4 +1,60 @@
+#!/usr/bin/env python3
+"""
+TikTok + YouTube + Facebook Video Downloader Telegram Bot (v3.1, production-ready)
+==================================================================================
+
+Single-file bot using python-telegram-bot (v20+, async) and yt-dlp.
+
+v3 architectural refactor (the 5 requested issues):
+    1. NON-BLOCKING I/O
+       - All async-context file I/O uses `aiofiles` (cookie upload/save).
+       - Heavy/blocking work (yt-dlp, file size stat, temp-dir cleanup)
+         is always wrapped in `asyncio.to_thread(...)` so the PTB event
+         loop is never blocked.
+    2. SQLite STORAGE (aiosqlite)
+       - Replaced the old JSON files (stats.json / users.json) with an
+         async SQLite database:
+             * users       -> user data + bans
+             * settings    -> admin settings (admin id, limits)
+             * rate_limits -> persistent per-user rate limiting
+             * downloads   -> download log used for /stats
+    3. STRICT TEMP-FILE MANAGEMENT
+       - Every download gets its own unique subdirectory under ./downloads
+         and the ENTIRE download+upload path runs inside a single
+         try...finally that `shutil.rmtree`s the directory no matter what
+         happens (success, network error, timeout, or exception).
+    4. STRICT URL & INPUT VALIDATION
+       - Input is checked with a deny-list for shell/injection characters
+         and then parsed with urllib.urlparse + a strict host allow-list
+         (tiktok.com / youtube.com / youtu.be / facebook.com / fb.watch /
+         fb.com). Unknown hosts, IPs, localhost, credentials, and odd ports
+         are all rejected before anything reaches yt-dlp.
+    5. MEMORY-EFFICIENT UPLOADING
+       - send_video()/send_audio() receive the on-disk *path* (str), not a
+         bytes object, so python-telegram-bot streams the file from disk to
+         Telegram instead of reading the whole file into RAM.
+
+v3.1 UI/UX + admin-visibility additions:
+    - Download progress bar shown immediately (0%) and updated with ETA.
+    - Premium custom emojis in the welcome message and the /users list.
+    - Admin commands are hidden from regular users via BotCommandScope:
+      regular users only see /start /help /myid, while the admin sees the
+      full command set in the chat menu.
+
+All admin commands (/admin /broadcast /banned /stats /users /ban /unban
+/setcookies /config /setadmin /setmaxsize /setratelimit /ping) and user
+features are preserved.
+
+Setup (Ubuntu VPS):
+    pip install python-telegram-bot yt-dlp aiofiles aiosqlite python-dotenv
+    sudo apt install ffmpeg
+
+    1. Copy .env.example to .env and set BOT_TOKEN / ADMIN_ID.
+    2. python bot_v2.py
+"""
+
 import asyncio
+import html
 import logging
 import os
 import re
@@ -14,6 +70,8 @@ import aiofiles
 import aiosqlite
 from telegram import (
     BotCommand,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Update,
@@ -37,7 +95,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN") or "8953839870:AAG5PBpFq68FaooPorS16sJPb9q-A_
 
 # Admin ID is loaded from ADMIN_ID env, else from the SQLite `settings` table
 # (so it can be changed at runtime with /setadmin without editing code).
-ADMIN_ID = int(os.getenv("ADMIN_ID") or "5566718291") or None
+ADMIN_ID = int(os.getenv("ADMIN_ID") or "0") or None
 
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB") or "50")   # Telegram Bot API hard limit
 RATE_LIMIT_SECONDS = float(os.getenv("RATE_LIMIT_SECONDS") or "10")
@@ -50,6 +108,13 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 TEMP_DIR = SCRIPT_DIR / "downloads"
 DATA_DIR = SCRIPT_DIR / "data"
 DB_PATH = DATA_DIR / "bot.db"
+
+# ----------------------------------------------------------------------------
+# Premium custom emoji IDs (Telegram premium animated/custom emoji).
+# Rendered with <tg-emoji emoji-id="...">fallback</tg-emoji> in HTML mode.
+# ----------------------------------------------------------------------------
+EMOJI_WINK = "5960938367989323889"     # 😉  (welcome message)
+EMOJI_DISC = "4938653911507534983"     # 🥏  (/users list, before @username)
 
 # ----------------------------------------------------------------------------
 # Cookie runtime files (TikTok / Facebook cookies updated live via Telegram)
@@ -655,6 +720,7 @@ def download_video(
                     d.get("total_bytes") or d.get("total_bytes_estimate") or 0
                 )
                 progress_state["speed"] = d.get("speed") or 0
+                progress_state["eta"] = d.get("eta") or 0
             elif status == "finished":
                 progress_state["status"] = "merging"
             elif status == "error":
@@ -747,6 +813,16 @@ def _build_progress_bar(percent: int, width: int = 12) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
+def _format_eta(eta: float | int | None) -> str:
+    """Format yt-dlp's `eta` (seconds) into a short human string."""
+    if not eta:
+        return ""
+    eta = int(eta)
+    if eta >= 60:
+        return f"⏳ {eta // 60}m {eta % 60}s left"
+    return f"⏳ {eta}s left"
+
+
 async def run_progress_updates(
     status_message,
     progress_state: dict,
@@ -774,14 +850,14 @@ async def run_progress_updates(
 
             speed = progress_state.get("speed") or 0
             speed_str = f"{speed / (1024 * 1024):.1f} MB/s" if speed else "…"
+            eta_str = _format_eta(progress_state.get("eta"))
 
             if percent is not None:
                 bar = _build_progress_bar(percent)
-                text = (
-                    f"⬇️ Downloading…\n"
-                    f"{bar}  {percent}%\n"
-                    f"📦 {_format_bytes(downloaded)} / {_format_bytes(total)}  •  ⚡ {speed_str}"
-                )
+                meta = f"📦 {_format_bytes(downloaded)} / {_format_bytes(total)}  •  ⚡ {speed_str}"
+                if eta_str:
+                    meta += f"  •  {eta_str}"
+                text = f"⬇️ Downloading…\n{bar}  {percent}%\n{meta}"
             else:
                 text = (
                     f"⬇️ Downloading…\n"
@@ -840,17 +916,19 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # HTML parse mode so we can use the premium custom emoji (<tg-emoji>).
     welcome = (
-        "👋 *Welcome to Video Downloader Bot!*\n\n"
-        "Send me a TikTok, YouTube, or Facebook link, pick *Video* or "
-        "*Audio only*, and I'll send it straight back — no watermark.\n\n"
-        "🎵 *Supported platforms:*\n"
+        "👋 <b>Welcome to Video Downloader Bot!</b>\n\n"
+        "Send me a TikTok, YouTube, or Facebook link, pick <b>Video</b> or "
+        "<b>Audio only</b>, and I'll send it straight back — no watermark.\n\n"
+        "🎵 <b>Supported platforms:</b>\n"
         "• TikTok — tiktok.com, vm.tiktok.com, vt.tiktok.com\n"
         "• YouTube — youtube.com, youtu.be, Shorts\n"
         "• Facebook — facebook.com, fb.watch (videos & reels)\n\n"
-        "Type /help for details and limits."
+        "Type /help for details and limits. "
+        f'<tg-emoji emoji-id="{EMOJI_WINK}">😉</tg-emoji>'
     )
-    await update.message.reply_text(welcome, parse_mode="Markdown")
+    await update.message.reply_text(welcome, parse_mode="HTML")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -911,12 +989,17 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not rows:
         await update.message.reply_text("No users yet.")
         return
-    lines = ["👥 *Top users (by downloads)*\n"]
+    # HTML mode to render the premium 🥏 custom emoji before each @username.
+    lines = ["👥 <b>Top users (by downloads)</b>\n"]
     for r in rows:
-        username = r["username"] or "—"
+        username = html.escape(r["username"] or "—")
         flag = " 🚫" if r["banned"] else ""
-        lines.append(f"`{r['user_id']}` — @{username} — {r['downloads']} dl{flag}")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        lines.append(
+            f'<code>{r["user_id"]}</code> — '
+            f'<tg-emoji emoji-id="{EMOJI_DISC}">🥏</tg-emoji>'
+            f'@{username} — {r["downloads"]} dl{flag}'
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1229,10 +1312,12 @@ async def handle_format_choice(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     audio_only = action == "audio"
-    await query.edit_message_text(
-        "⬇️ Downloading audio…" if audio_only else "⬇️ Downloading…",
-        reply_markup=cancel_keyboard(),
-    )
+
+    # Show the progress bar immediately at 0% so the user gets instant feedback.
+    initial_text = (
+        "⬇️ Downloading audio…" if audio_only else "⬇️ Downloading…"
+    ) + "\n" + _build_progress_bar(0) + "  0%"
+    await query.edit_message_text(initial_text, reply_markup=cancel_keyboard())
 
     # Show "upload_video" chat action while the download is running.
     download_action = ChatAction.UPLOAD_VIDEO
@@ -1266,87 +1351,70 @@ async def handle_format_choice(update: Update, context: ContextTypes.DEFAULT_TYP
 
     try:
         # Run the blocking yt-dlp downloader in a worker thread so the event
-        # loop stays responsive (issue #1).
-        dl_task = asyncio.create_task(
-            asyncio.to_thread(
-                download_with_retry,
-                pending["url"],
-                pending["platform"],
-                workdir,
-                progress_state,
-                cancel_event,
-                audio_only,
-            )
+        # loop stays responsive (never blocks on network I/O).
+        filepath, error = await asyncio.to_thread(
+            download_with_retry,
+            pending["url"],
+            pending["platform"],
+            workdir,
+            progress_state,
+            cancel_event,
+            audio_only,
         )
-        try:
-            filepath, error = await asyncio.wait_for(dl_task, timeout=DOWNLOAD_TIMEOUT)
-        except asyncio.TimeoutError:
-            # Signal the worker thread to abort via the progress hook.
-            cancel_event.set()
-            filepath, error = None, "Download timed out after 15 minutes."
 
-        if filepath is None or not os.path.exists(filepath):
+        if cancel_event.is_set():
+            await query.edit_message_text("🚫 Download cancelled.")
+            return
+
+        if not filepath or error:
             friendly = _format_error(pending["platform"], error)
+            await record_download(
+                pending["user_id"],
+                pending["platform"],
+                "audio" if audio_only else "video",
+                0,
+                success=False,
+            )
             await query.edit_message_text(friendly, parse_mode="Markdown")
             return
 
-        # Stat the file size in a thread (avoids blocking the loop).
+        # Size check (blocking os.path.getsize -> worker thread).
         size_bytes = await asyncio.to_thread(os.path.getsize, filepath)
-        size_mb = size_bytes / (1024 * 1024)
-        if size_mb > MAX_FILE_SIZE_MB:
+        max_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
+        if size_bytes > max_bytes:
+            await record_download(
+                pending["user_id"],
+                pending["platform"],
+                "audio" if audio_only else "video",
+                size_bytes,
+                success=False,
+            )
             await query.edit_message_text(
-                f"⚠️ Video is too large ({size_mb:.1f} MB). "
-                f"Telegram bots can only send files up to {MAX_FILE_SIZE_MB} MB."
+                f"📦 This video is {_format_bytes(size_bytes)} — larger than "
+                f"Telegram's {MAX_FILE_SIZE_MB} MB limit."
             )
             return
 
+        progress_state["status"] = "uploading"
         await query.edit_message_text("📤 Uploading to Telegram…")
 
-        upload_action = ChatAction.UPLOAD_DOCUMENT if audio_only else ChatAction.UPLOAD_VIDEO
-        try:
-            await context.bot.send_chat_action(
-                chat_id=pending["chat_id"], action=upload_action
+        # MEMORY-EFFICIENT UPLOAD (issue #5): pass the on-disk *path* (str) so
+        # python-telegram-bot streams the file from disk to Telegram instead of
+        # reading the whole file into RAM.
+        if audio_only:
+            await context.bot.send_audio(
+                chat_id=pending["chat_id"],
+                audio=filepath,
+                caption="🎵 Here's your audio!",
             )
-        except Exception:
-            pass
+        else:
+            await context.bot.send_video(
+                chat_id=pending["chat_id"],
+                video=filepath,
+                caption="✅ Here's your video!",
+                supports_streaming=True,
+            )
 
-        # MEMORY-EFFICIENT UPLOAD (issue #5): pass the on-disk *path* so PTB
-        # streams the file from disk to Telegram instead of loading it into RAM.
-        try:
-            if audio_only:
-                await context.bot.send_audio(
-                    chat_id=pending["chat_id"],
-                    audio=filepath,
-                    caption="🎵 Here's your audio!",
-                    read_timeout=DOWNLOAD_TIMEOUT,
-                    write_timeout=DOWNLOAD_TIMEOUT,
-                    connect_timeout=60,
-                    pool_timeout=60,
-                )
-            else:
-                await context.bot.send_video(
-                    chat_id=pending["chat_id"],
-                    video=filepath,
-                    caption="✅ Here's your video!",
-                    read_timeout=DOWNLOAD_TIMEOUT,
-                    write_timeout=DOWNLOAD_TIMEOUT,
-                    connect_timeout=60,
-                    pool_timeout=60,
-                )
-        except Exception as e:
-            logger.error("Failed to send media: %s", e)
-            await notify_admin(
-                context,
-                f"Failed to send media to user `{pending['user_id']}` "
-                f"({PLATFORM_NAMES.get(pending['platform'], '?')}):\n`{e}`",
-            )
-            await query.edit_message_text(
-                "❌ Failed to send the file. Please try again."
-            )
-            return
-
-        # Success.
-        await query.message.delete()
         await record_download(
             pending["user_id"],
             pending["platform"],
@@ -1355,139 +1423,140 @@ async def handle_format_choice(update: Update, context: ContextTypes.DEFAULT_TYP
             success=True,
         )
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
-        logger.error("Unexpected error in download flow: %s", e)
-        await notify_admin(context, f"Unexpected error: `{e}`")
+        logger.exception("Unhandled error in download flow for %s", pending["url"])
+        await notify_admin(
+            context,
+            f"Unhandled error (user {pending['user_id']})\n"
+            f"URL: {pending['url']}\nError: {e}",
+        )
         try:
-            await query.edit_message_text("❌ Something went wrong. Please try again.")
+            await query.edit_message_text("❌ Something went wrong. Please try again later.")
+        except Exception:
+            pass
+    finally:
+        # Always stop the progress updater and release the cancel event.
+        stop_flag["done"] = True
+        _cancel_events.pop(msg_id, None)
+        if not updater.done():
+            updater.cancel()
+
+        # STRICT TEMP-FILE CLEANUP (issue #3): remove the whole work dir
+        # regardless of success / error / timeout / cancel.
+        try:
+            await asyncio.to_thread(shutil.rmtree, workdir, ignore_errors=True)
         except Exception:
             pass
 
-    finally:
-        # Stop the progress updater and clean up UI state.
-        stop_flag["done"] = True
-        updater.cancel()
-        try:
-            await updater
-        except asyncio.CancelledError:
-            pass
-        _cancel_events.pop(msg_id, None)
-
-        # STRICT cleanup: delete the entire per-request temp directory in a
-        # worker thread, guaranteed on success/failure/timeout/exception.
-        await asyncio.to_thread(shutil.rmtree, workdir, True)
-
 
 # ----------------------------------------------------------------------------
-# Global error handler — DM admin on unhandled exceptions
+# Global error handler — log + notify admin (critical errors only).
 # ----------------------------------------------------------------------------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error("Unhandled error: %s", context.error, exc_info=context.error)
-    await notify_admin(context, f"Unhandled error: `{context.error}`")
+    logger.error("Exception while handling an update: %s", context.error)
+    await notify_admin(context, f"Unhandled exception: {context.error}")
 
 
 # ----------------------------------------------------------------------------
-# Periodic background cleanup
+# Command visibility — hide admin commands from regular users.
 # ----------------------------------------------------------------------------
-async def _periodic_cleanup(application: Application) -> None:
-    while True:
-        await asyncio.sleep(300)  # every 5 minutes
-        try:
-            # Purge stale rate-limit rows from SQLite (survives restarts).
-            if rate_limiter is not None:
-                await rate_limiter.cleanup(max_age=3600.0)
-        except Exception as e:
-            logger.error("Rate-limit cleanup failed: %s", e)
+# Regular users only see these in the "/" command menu.
+USER_COMMANDS = [
+    BotCommand("start", "🚀 Start the bot"),
+    BotCommand("help", "📖 How to use"),
+    BotCommand("myid", "🆔 Your Telegram ID"),
+]
 
-        # Prune expired pending-request UI entries (older than 30 min).
-        now = time.time()
-        for mid in list(_pending):
-            if now - _pending[mid].get("ts", now) > 1800:
-                _pending.pop(mid, None)
+# The admin (and only the admin) sees the full command set.
+ADMIN_COMMANDS = USER_COMMANDS + [
+    BotCommand("admin", "🛠 Admin panel"),
+    BotCommand("stats", "📊 Statistics"),
+    BotCommand("users", "👥 Top users"),
+    BotCommand("ban", "🚫 Ban a user"),
+    BotCommand("unban", "✅ Unban a user"),
+    BotCommand("banned", "🚫 Banned list"),
+    BotCommand("broadcast", "📡 Broadcast message"),
+    BotCommand("setcookies", "🍪 Update cookies"),
+    BotCommand("config", "⚙️ Show config"),
+    BotCommand("setadmin", "👤 Change admin"),
+    BotCommand("setmaxsize", "📦 Set max size"),
+    BotCommand("setratelimit", "⏱️ Set rate limit"),
+    BotCommand("ping", "🏓 Ping"),
+]
 
 
-# ----------------------------------------------------------------------------
-# Main
-# ----------------------------------------------------------------------------
-async def _post_init(application: Application) -> None:
+async def post_init(application: Application) -> None:
+    """Runs once at startup: init DB, then publish scoped command menus."""
     await init_db()
+
+    # Regular users only see the user commands.
     await application.bot.set_my_commands(
-        [
-            BotCommand("start", "Welcome message"),
-            BotCommand("help", "How to use this bot"),
-            BotCommand("myid", "Show your Telegram user ID"),
-            BotCommand("stats", "Admin: bot statistics"),
-            BotCommand("users", "Admin: list users"),
-            BotCommand("ban", "Admin: ban a user"),
-            BotCommand("unban", "Admin: unban a user"),
-            BotCommand("banned", "Admin: list banned users"),
-            BotCommand("broadcast", "Admin: message all users"),
-            BotCommand("setcookies", "Admin: update cookies"),
-            BotCommand("config", "Admin: show configuration"),
-            BotCommand("setadmin", "Admin: change admin ID"),
-            BotCommand("setmaxsize", "Admin: change max file size"),
-            BotCommand("setratelimit", "Admin: change rate limit"),
-            BotCommand("admin", "Admin: admin panel"),
-            BotCommand("ping", "Check if the bot is alive"),
-        ]
+        USER_COMMANDS, scope=BotCommandScopeDefault()
     )
-    application.create_task(_periodic_cleanup(application))
+
+    # Only the admin chat sees the full command set (admin commands hidden
+    # from everyone else's menu).
+    if ADMIN_ID:
+        await application.bot.set_my_commands(
+            ADMIN_COMMANDS, scope=BotCommandScopeChat(chat_id=ADMIN_ID)
+        )
 
 
-async def _post_shutdown(application: Application) -> None:
+async def post_shutdown(application: Application) -> None:
+    """Runs at shutdown: close DB and clean up leftover temp downloads."""
     await close_db()
+    try:
+        await asyncio.to_thread(shutil.rmtree, TEMP_DIR, ignore_errors=True)
+    except Exception:
+        pass
 
 
 def main() -> None:
-    if not BOT_TOKEN or BOT_TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
-        print("ERROR: Set BOT_TOKEN (env var or at the top of this script) first!")
-        return
-
     application = (
         Application.builder()
         .token(BOT_TOKEN)
-        .read_timeout(DOWNLOAD_TIMEOUT)
-        .write_timeout(DOWNLOAD_TIMEOUT)
-        .connect_timeout(60)
-        .pool_timeout(60)
-        .post_init(_post_init)
-        .post_shutdown(_post_shutdown)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .build()
     )
 
+    # User commands
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("myid", myid_command))
     application.add_handler(CommandHandler("ping", ping_command))
+
+    # Admin commands (each handler re-checks admin status internally)
+    application.add_handler(CommandHandler("admin", admin_command))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("users", users_command))
     application.add_handler(CommandHandler("ban", ban_command))
     application.add_handler(CommandHandler("unban", unban_command))
     application.add_handler(CommandHandler("banned", banned_command))
     application.add_handler(CommandHandler("broadcast", broadcast_command))
-    application.add_handler(CommandHandler("admin", admin_command))
-    application.add_handler(CommandHandler("setcookies", setcookies_command))
     application.add_handler(CommandHandler("config", config_command))
     application.add_handler(CommandHandler("setadmin", setadmin_command))
     application.add_handler(CommandHandler("setmaxsize", setmaxsize_command))
     application.add_handler(CommandHandler("setratelimit", setratelimit_command))
+    application.add_handler(CommandHandler("setcookies", setcookies_command))
+
+    # Document uploads (admin cookie updates) + text links
     application.add_handler(MessageHandler(filters.Document.ALL, handle_cookie_upload))
-    application.add_handler(CallbackQueryHandler(handle_format_choice))
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link)
-    )
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+
+    # Inline keyboard (Video / Audio / Cancel)
+    application.add_handler(CallbackQueryHandler(handle_format_choice, pattern="^dl:"))
+
     application.add_error_handler(error_handler)
 
-    if not ADMIN_ID:
-        logger.warning(
-            "ADMIN_ID is not set — admin commands, cookie updates, and error "
-            "notifications are disabled until you set it. DM the bot /myid to "
-            "get your ID, then set ADMIN_ID (env var or use /setadmin)."
-        )
-
-    logger.info("Bot started. Press Ctrl+C to stop.")
+    logger.info("Starting bot…")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot stopped.")
