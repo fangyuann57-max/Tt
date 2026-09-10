@@ -239,7 +239,7 @@ CREATE INDEX IF NOT EXISTS idx_downloads_user ON downloads(user_id);
 """
 
 
-async def init_db() -> None:
+async def init_db(application: Application) -> None:
     """Create the DB connection + schema and load persisted settings."""
     global _db_conn
     _db_conn = await aiosqlite.connect(DB_PATH)
@@ -297,7 +297,7 @@ async def _setup_bot_commands() -> None:
         logger.warning("Could not set bot command scopes: %s", e)
 
 
-async def close_db() -> None:
+async def close_db(application: Application) -> None:
     global _db_conn
     if _db_conn is not None:
         await _db_conn.close()
