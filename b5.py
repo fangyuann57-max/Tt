@@ -46,7 +46,7 @@ BOT_TOKEN = "8953839870:AAG5PBpFq68FaooPorS16sJPb9q-A_vw6Hs"  # from @BotFather
 
 # Your Telegram user ID — only this account can update cookies via the bot.
 # Send /myid to the bot once to find out your ID, then set it here.
-ADMIN_ID = 0
+ADMIN_ID = 5566718291
 
 MAX_FILE_SIZE_MB = 50        # Hard limit on Telegram's standard Bot API
 RATE_LIMIT_SECONDS = 10      # 1 request per user per 10s
