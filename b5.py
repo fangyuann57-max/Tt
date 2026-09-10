@@ -42,7 +42,7 @@ import yt_dlp
 # ----------------------------------------------------------------------------
 # CONFIG — fill these in before running
 # ----------------------------------------------------------------------------
-BOT_TOKEN = "PASTE_YOUR_BOT_TOKEN_HERE"  # from @BotFather
+BOT_TOKEN = "8953839870:AAG5PBpFq68FaooPorS16sJPb9q-A_vw6Hs"  # from @BotFather
 
 # Your Telegram user ID — only this account can update cookies via the bot.
 # Send /myid to the bot once to find out your ID, then set it here.
