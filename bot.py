@@ -1437,7 +1437,8 @@ async def setcookies_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return
         status = await update.message.reply_text("⬇️ Downloading cookie file…")
         try:
-            buf = await doc.get_file().download_as_bytearray()
+            telegram_file = await doc.get_file()
+            buf = await telegram_file.download_as_bytearray()
         except Exception as e:
             await status.edit_text(f"❌ Couldn't download the file: {e}")
             return
@@ -1484,7 +1485,8 @@ async def cookie_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     status = await update.message.reply_text("⬇️ Reading cookie file…")
     try:
-        buf = await doc.get_file().download_as_bytearray()
+        telegram_file = await doc.get_file()
+        buf = await telegram_file.download_as_bytearray()
     except Exception as e:
         await status.edit_text(f"❌ Couldn't download the file: {e}")
         return
