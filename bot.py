@@ -1392,7 +1392,12 @@ async def setcookies_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("⛔ You're not allowed to do this.")
         return
 
-    doc = update.message.document if update.message else None
+    doc = None
+if update.message:
+    if update.message.document:
+        doc = update.message.document
+    elif update.message.reply_to_message and update.message.reply_to_message.document:
+        doc = update.message.reply_to_message.document
     if not doc:
         await update.message.reply_text(
             "📄 To update cookies:\n\n"
