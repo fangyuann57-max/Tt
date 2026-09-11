@@ -1,3 +1,74 @@
+#!/usr/bin/env python3
+"""
+TikTok + Facebook Video/Photo Downloader Telegram Bot (v3.4, production-ready)
+================================================================================
+
+Single-file bot using python-telegram-bot (v20+, async) and yt-dlp.
+
+v3 architectural refactor (the 5 requested issues):
+    1. NON-BLOCKING I/O
+       - All async-context file I/O uses `aiofiles` (cookie upload/save).
+       - Heavy/blocking work (yt-dlp, file size stat, temp-dir cleanup)
+         is always wrapped in `asyncio.to_thread(...)` so the PTB event
+         loop is never blocked.
+    2. SQLite STORAGE (aiosqlite)
+       - Replaced the old JSON files (stats.json / users.json) with an
+         async SQLite database:
+             * users       -> user data + bans
+             * settings    -> admin settings (admin id, limits)
+             * rate_limits -> persistent per-user rate limiting
+             * downloads   -> download log used for /stats
+    3. STRICT TEMP-FILE MANAGEMENT
+       - Every download gets its own unique subdirectory under ./downloads
+         and the ENTIRE download+upload path runs inside a single
+         try...finally that `shutil.rmtree`s the directory no matter what
+         happens (success, network error, timeout, or exception).
+    4. STRICT URL & INPUT VALIDATION
+       - Input is checked with a deny-list for shell/injection characters
+         and then parsed with urllib.urlparse + a strict host allow-list
+         (tiktok.com / facebook.com / fb.watch / fb.com). Unknown hosts,
+         IPs, localhost, credentials, and odd ports are all rejected
+         before anything reaches yt-dlp.
+    5. MEMORY-EFFICIENT UPLOADING
+       - send_video()/send_audio()/send_photo() receive the on-disk *path*
+         (str), not a bytes object, so python-telegram-bot streams the file
+         from disk to Telegram instead of reading the whole file into RAM.
+
+v3.1 UI/UX + admin-visibility additions:
+    - Download progress bar shown immediately (0%) and updated with ETA.
+    - Premium custom emojis in the welcome message and the /users list.
+    - Admin commands are hidden from regular users via BotCommandScope:
+      regular users only see /start /help /myid, while the admin sees the
+      full command set in the chat menu.
+
+v3.2 photo + cookie fixes:
+    - TikTok & Facebook *photo posts* now download (image format fallbacks)
+      and are sent with send_photo().
+    - /setcookies detects the platform from the cookie domains.
+
+v3.3 reply-based cookie upload:
+    - /setcookies now works by REPLYING to a cookie .txt file (or a message
+      containing cookie text). Sending a .txt file directly to the admin is
+      also auto-detected and saved as a convenience.
+
+v3.4 YouTube removed + cookie-upload fix:
+    - YouTube support removed entirely (TikTok + Facebook only).
+    - Fixed a bug where uploading cookies as a .txt file always failed:
+      `doc.get_file()` is async in PTB v20 and must be awaited before
+      calling `.download_as_bytearray()` on the result.
+
+All admin commands (/admin /broadcast /banned /stats /users /ban /unban
+/setcookies /config /setadmin /setmaxsize /setratelimit /ping) and user
+features are preserved.
+
+Setup (Ubuntu VPS):
+    pip install python-telegram-bot yt-dlp aiofiles aiosqlite python-dotenv
+    sudo apt install ffmpeg
+
+    1. Copy .env.example to .env and set BOT_TOKEN / ADMIN_ID.
+    2. python bot_v2.py
+"""
+
 import asyncio
 import html
 import logging
@@ -433,18 +504,6 @@ rate_limiter: RateLimiter | None = None
 # ----------------------------------------------------------------------------
 # Inline keyboards
 # ----------------------------------------------------------------------------
-def choice_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("🎬 Video", callback_data="dl:video"),
-                InlineKeyboardButton("🎵 Audio only", callback_data="dl:audio"),
-            ],
-            [InlineKeyboardButton("❌ Cancel", callback_data="dl:cancel")],
-        ]
-    )
-
-
 def cancel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("❌ Cancel", callback_data="dl:cancel")]]
@@ -1010,9 +1069,8 @@ async def run_progress_updates(
 
 
 # ----------------------------------------------------------------------------
-# Pending downloads + cancel events (in-memory UI state only)
+# In-flight cancel events (in-memory UI state only)
 # ----------------------------------------------------------------------------
-_pending: dict[int, dict] = {}
 _cancel_events: dict[int, threading.Event] = {}
 
 
@@ -1041,8 +1099,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # HTML parse mode so we can use the premium custom emoji (<tg-emoji>).
     welcome = (
         "👋 <b>Welcome to Video Downloader Bot!</b>\n\n"
-        "Send me a TikTok or Facebook link, pick <b>Video</b> or "
-        "<b>Audio only</b>, and I'll send it straight back — no watermark.\n\n"
+        "Just send me a TikTok or Facebook link — no commands, no menus. "
+        "I'll download it and send it straight back automatically, "
+        "no watermark.\n\n"
         "🎵 <b>Supported platforms:</b>\n"
         "• TikTok — tiktok.com, vm.tiktok.com, vt.tiktok.com (video & photos)\n"
         "• Facebook — facebook.com, fb.watch (videos, reels & photos)\n\n"
@@ -1057,8 +1116,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "📖 *How to use*\n\n"
         "1. Copy a TikTok or Facebook link.\n"
         "2. Send it here.\n"
-        "3. Choose 🎬 Video or 🎵 Audio only.\n"
-        "4. Wait — large videos can take a few minutes (❌ Cancel anytime).\n\n"
+        "3. That's it — download + send happens automatically "
+        "(❌ Cancel anytime while it's working).\n\n"
         "*Commands*\n"
         "/start — Welcome message\n"
         "/help — This help text\n"
@@ -1412,7 +1471,36 @@ async def cookie_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # ----------------------------------------------------------------------------
-# Main message handler — validates URL, applies rate limit, offers choice.
+# URL-based photo detection — skip the Video/Audio keyboard for links that
+# are clearly photo posts, so photos auto-download and get sent immediately.
+# ----------------------------------------------------------------------------
+def _looks_like_photo_url(url: str, platform: str) -> bool:
+    """Best-effort guess from the URL shape alone (no network call).
+
+    TikTok photo posts use /photo/<id> instead of /video/<id>.
+    Facebook photo posts use /photo/, /photos/, photo.php, or a
+    ?fbid=... query param instead of /videos/ or fb.watch/....
+    This is a heuristic: if it guesses wrong, the platform simply won't
+    have a video format and download_video()'s image fallback still
+    kicks in — it just means the user saw the format keyboard first.
+    """
+    low = url.lower()
+    path = urlparse(low).path
+    if platform == "tiktok":
+        return "/photo/" in path
+    if platform == "facebook":
+        return (
+            "/photo/" in path
+            or "/photos/" in path
+            or "photo.php" in path
+            or "fbid=" in low
+        )
+    return False
+
+
+# ----------------------------------------------------------------------------
+# Main message handler — validates URL, applies rate limit, offers choice
+# (or auto-downloads immediately when the link is clearly a photo post).
 # ----------------------------------------------------------------------------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
@@ -1434,21 +1522,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(f"⏳ Slow down! Try again in {remaining:.0f}s.")
         return
 
-    _pending[update.effective_chat.id] = {
-        "url": url,
-        "platform": platform,
-        "user_id": user.id,
-    }
-    await update.message.reply_text(
-        f"🔗 *{PLATFORM_NAMES.get(platform, 'video')} link received*\n\n"
-        "Choose a download format:",
-        reply_markup=choice_keyboard(),
-        parse_mode="Markdown",
+    chat_id = update.effective_chat.id
+
+    # No command, no Video/Audio choice — every valid link auto-downloads
+    # immediately (best video, or the photo fallback if it's a photo post).
+    icon = "🖼️" if _looks_like_photo_url(url, platform) else "🎬"
+    status_message = await update.message.reply_text(
+        f"{icon} {PLATFORM_NAMES.get(platform, 'Link')} link received — downloading…",
+        reply_markup=cancel_keyboard(),
+    )
+    await run_download_and_send(
+        context, chat_id, user.id, url, platform, audio_only=False,
+        status_message=status_message,
     )
 
 
 # ----------------------------------------------------------------------------
-# Callback handler — runs the actual download + upload with strict cleanup.
+# Callback handler — handles the ❌ Cancel button shown during a download.
 # ----------------------------------------------------------------------------
 async def handle_format_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -1459,39 +1549,32 @@ async def handle_format_choice(update: Update, context: ContextTypes.DEFAULT_TYP
     if data == "dl:cancel":
         if chat_id in _cancel_events:
             _cancel_events[chat_id].set()
-        _pending.pop(chat_id, None)
         try:
             await query.edit_message_text("🚫 Cancelled.")
         except Exception:
             pass
         return
 
-    pending = _pending.pop(chat_id, None)
-    if not pending:
-        try:
-            await query.edit_message_text("⚠️ This request has expired. Send the link again.")
-        except Exception:
-            pass
-        return
 
-    if data not in ("dl:video", "dl:audio"):
-        return
-
-    audio_only = data == "dl:audio"
-    url = pending["url"]
-    platform = pending["platform"]
-    user_id = pending["user_id"]
-
+# ----------------------------------------------------------------------------
+# Shared download + upload routine — runs the actual download + upload with
+# strict cleanup. Called both after a Video/Audio button press and directly
+# for auto-detected photo links (see _looks_like_photo_url above).
+# ----------------------------------------------------------------------------
+async def run_download_and_send(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    user_id: int,
+    url: str,
+    platform: str,
+    audio_only: bool,
+    status_message,
+) -> None:
     # Unique temp dir for this download so parallel requests never collide.
     work_dir = Path(tempfile.mkdtemp(prefix="dl_", dir=TEMP_DIR))
     cancel_event = threading.Event()
     _cancel_events[chat_id] = cancel_event
     progress_state = {"status": "starting", "downloaded": 0, "total": 0, "speed": 0, "eta": 0}
-
-    status_message = await query.edit_message_text(
-        "⬇️ Downloading…\n░░░░░░░░░░░░  0%",
-        reply_markup=cancel_keyboard(),
-    )
 
     # Send the chat action immediately; the progress task keeps it alive.
     action = ChatAction.UPLOAD_VIDEO
