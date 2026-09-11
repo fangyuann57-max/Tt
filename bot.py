@@ -694,6 +694,19 @@ def _format_error(platform: str, error: str | None) -> str:
     if "cancelled" in s or "cancel" in s:
         return "🚫 Download cancelled."
 
+    # TikTok "photo" posts (slideshows) aren't matched by yt-dlp's TikTok
+    # extractor at all, so they surface as a generic "Unsupported URL"
+    # error. This is a deliberate upstream decision — yt-dlp issue #9990
+    # ("[TikTok] Support for Photos") was closed as "wontfix" — not a bug
+    # in this bot, and not something a retry or a yt-dlp upgrade will fix.
+    if "unsupported url" in s and "/photo/" in s:
+        return (
+            "🖼️ That's a TikTok *photo/slideshow* post, not a video — "
+            "yt-dlp doesn't support downloading TikTok photo posts "
+            "(an upstream limitation, not a bug in this bot). Only TikTok "
+            "*videos* can be downloaded right now."
+        )
+
     # Anti-bot / rate-limit walls are NOT "private" — detect them first
     # so we don't mislabel a public post as private/sign-in.
     if any(m in s for m in ("confirm you're not a bot", "not a bot", "sign in to confirm")):
@@ -844,6 +857,19 @@ def download_video(
 
     Returns (filepath, None) on success, (None, error_message) on failure.
     """
+    # --- Fast-fail: TikTok "photo" posts are not matched by yt-dlp at all ---
+    # yt-dlp's TikTokIE._VALID_URL only matches /video/, /share/video/ and
+    # /embed/ paths. There is no /photo/ pattern anywhere in the extractor,
+    # so a photo-post URL falls through to yt-dlp's generic extractor and
+    # dies with "Unsupported URL". This is not version-specific and not a
+    # transient failure: TikTok photo support was requested upstream in
+    # yt-dlp issue #9990 ("[TikTok] Support for Photos") and the maintainers
+    # closed it as "wontfix". Upgrading yt-dlp or retrying will not help, so
+    # fail immediately instead of burning a full download+retry cycle (and
+    # the DOWNLOAD_TIMEOUT budget) on a request that can never succeed.
+    if platform == "tiktok" and re.search(r"tiktok\.com/@[^/?#]+/photo/\d+", url):
+        return None, "Unsupported URL: TikTok photo post (/photo/) is not supported by yt-dlp."
+
     ydl_opts = {
         "outtmpl": os.path.join(out_dir, "%(id)s.%(ext)s"),
         "quiet": True,
