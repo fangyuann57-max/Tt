@@ -43,7 +43,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN") or "8953839870:AAG5PBpFq68FaooPorS16sJPb9q-A_
 # (so it can be changed at runtime with /setadmin without editing code).
 ADMIN_ID = int(os.getenv("ADMIN_ID") or "5566718291") or None
 
-MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB") or "50")   # Telegram Bot API hard limit
+MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB") or "500")  # see caveat below
 RATE_LIMIT_SECONDS = float(os.getenv("RATE_LIMIT_SECONDS") or "10")
 PROGRESS_UPDATE_INTERVAL = 4     # seconds between progress-message edits
 DOWNLOAD_TIMEOUT = 900           # 15 minutes max per download
@@ -806,17 +806,23 @@ def download_video(
             }
         ]
     elif platform == "facebook":
-        # Videos first, then fall back to photo/image posts (jpg/png/webp).
+        # Videos first, then fall back to photo/image posts. The trailing
+        # bare "best" is the important part for photos: Facebook photo
+        # posts don't always expose a format matching one of the listed
+        # image extensions, so without a catch-all yt-dlp raises
+        # "Requested format is not available" and the photo never downloads.
         ydl_opts["format"] = (
             "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
             "bestvideo+bestaudio/"
             "best[ext=mp4]/best[ext=webm]/"
-            "best[ext=jpg]/best[ext=jpeg]/best[ext=png]/best[ext=webp]"
+            "best[ext=jpg]/best[ext=jpeg]/best[ext=png]/best[ext=webp]/"
+            "best"
         )
         ydl_opts["merge_output_format"] = "mp4"
     else:  # tiktok
         # TikTok photo posts are usually returned as a slideshow mp4, but fall
-        # back to raw image formats in case yt-dlp extracts individual images.
+        # back to raw image formats (and finally a bare "best") in case
+        # yt-dlp extracts individual images instead of a rendered slideshow.
         ydl_opts["format"] = (
             "best[ext=mp4]/"
             "best[ext=jpg]/best[ext=jpeg]/best[ext=png]/best[ext=webp]/"
