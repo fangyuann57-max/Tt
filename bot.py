@@ -1,68 +1,3 @@
-#!/usr/bin/env python3
-"""
-TikTok + Facebook Video/Photo Downloader Telegram Bot (v3.4, production-ready)
-==============================================================================
-
-Single-file bot using python-telegram-bot (v20+, async) and yt-dlp.
-
-v3 architectural refactor (the 5 requested issues):
-    1. NON-BLOCKING I/O
-       - All async-context file I/O uses `aiofiles` (cookie upload/save).
-       - Heavy/blocking work (yt-dlp, file size stat, temp-dir cleanup)
-         is always wrapped in `asyncio.to_thread(...)` so the PTB event
-         loop is never blocked.
-    2. SQLite STORAGE (aiosqlite)
-       - Replaced the old JSON files (stats.json / users.json) with an
-         async SQLite database:
-             * users       -> user data + bans
-             * settings    -> admin settings (admin id, limits)
-             * rate_limits -> persistent per-user rate limiting
-             * downloads   -> download log used for /stats
-    3. STRICT TEMP-FILE MANAGEMENT
-       - Every download gets its own unique subdirectory under ./downloads
-         and the ENTIRE download+upload path runs inside a single
-         try...finally that `shutil.rmtree`s the directory no matter what
-         happens (success, network error, timeout, or exception).
-    4. STRICT URL & INPUT VALIDATION
-       - Input is checked with a deny-list for shell/injection characters
-         and then parsed with urllib.urlparse + a strict host allow-list
-         (tiktok.com / facebook.com / fb.watch / fb.com). Unknown hosts, IPs,
-         localhost, credentials, and odd ports are all rejected before anything
-         reaches yt-dlp.
-    5. MEMORY-EFFICIENT UPLOADING
-       - send_video()/send_audio()/send_photo() receive the on-disk *path*
-         (str), not a bytes object, so python-telegram-bot streams the file
-         from disk to Telegram instead of reading the whole file into RAM.
-
-v3.1 UI/UX + admin-visibility additions:
-    - Download progress bar shown immediately (0%) and updated with ETA.
-    - Premium custom emojis in the welcome message and the /users list.
-    - Admin commands are hidden from regular users via BotCommandScope.
-
-v3.2 photo + cookie fixes:
-    - TikTok & Facebook *photo posts* now download (image format fallbacks)
-      and are sent with send_photo().
-
-v3.3 reply-based cookie upload:
-    - /setcookies now works by REPLYING to a cookie .txt file. Sending a .txt
-      file directly to the admin is also auto-detected and saved.
-
-v3.4 YouTube removed:
-    - YouTube support fully removed; only TikTok + Facebook remain.
-      YouTube URLs are now rejected at the validation layer.
-
-All admin commands (/admin /broadcast /banned /stats /users /ban /unban
-/setcookies /config /setadmin /setmaxsize /setratelimit /ping) and user
-features are preserved.
-
-Setup (Ubuntu VPS):
-    pip install python-telegram-bot yt-dlp aiofiles aiosqlite python-dotenv
-    sudo apt install ffmpeg
-
-    1. Copy .env.example to .env and set BOT_TOKEN / ADMIN_ID.
-    2. python bot_v2.py
-"""
-
 import asyncio
 import html
 import logging
@@ -692,7 +627,8 @@ def _format_error(platform: str, error: str | None) -> str:
     if "cancelled" in s or "cancel" in s:
         return "🚫 Download cancelled."
 
-    # Anti-bot / rate-limit wall (not "private").
+    # Anti-bot / rate-limit walls are NOT "private" — detect them first
+    # so we don't mislabel a public post as private/sign-in.
     if any(m in s for m in ("confirm you're not a bot", "not a bot", "sign in to confirm")):
         return (
             f"🤖 {pname} is temporarily asking us to verify we're not a bot "
@@ -1257,12 +1193,9 @@ async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     text = (
         "⚙️ *Current configuration*\n\n"
         f"• Admin ID: `{ADMIN_ID}`\n"
-        f"• Max file size: {MAX_FILE_SIZE_MB} MB\n"
-        f"• Rate limit: {RATE_LIMIT_SECONDS:.0f} seconds\n"
-        f"• Retry attempts: {RETRY_MAX_ATTEMPTS}\n"
-        f"• Download timeout: {DOWNLOAD_TIMEOUT} seconds\n"
-        f"• Database: `{DB_PATH}`\n"
-        f"• Supported platforms: TikTok, Facebook"
+        f"• Max file size: *{MAX_FILE_SIZE_MB} MB*\n"
+        f"• Rate limit: *{RATE_LIMIT_SECONDS:.0f} sec*\n"
+        f"• DB: `{DB_PATH.name}`"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -1271,56 +1204,53 @@ async def setadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not _is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ You're not allowed to do this.")
         return
+    global ADMIN_ID
     if not context.args:
         await update.message.reply_text("Usage: /setadmin <user_id>")
         return
     try:
-        new_id = int(context.args[0])
+        ADMIN_ID = int(context.args[0])
     except ValueError:
         await update.message.reply_text("❌ That's not a valid user ID.")
         return
-    global ADMIN_ID
-    ADMIN_ID = new_id
-    await set_setting("admin_id", str(new_id))
-    await _setup_bot_commands()
-    await update.message.reply_text(f"✅ Admin ID set to `{new_id}`.", parse_mode="Markdown")
+    await set_setting("admin_id", str(ADMIN_ID))
+    await update.message.reply_text(f"✅ Admin ID set to `{ADMIN_ID}`.", parse_mode="Markdown")
 
 
 async def setmaxsize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ You're not allowed to do this.")
         return
+    global MAX_FILE_SIZE_MB
     if not context.args:
         await update.message.reply_text("Usage: /setmaxsize <mb>")
         return
     try:
-        mb = int(context.args[0])
+        MAX_FILE_SIZE_MB = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("❌ That's not a valid number.")
+        await update.message.reply_text("❌ That's not a valid size.")
         return
-    global MAX_FILE_SIZE_MB
-    MAX_FILE_SIZE_MB = mb
-    await set_setting("max_file_size_mb", str(mb))
-    await update.message.reply_text(f"✅ Max file size set to {mb} MB.")
+    await set_setting("max_file_size_mb", str(MAX_FILE_SIZE_MB))
+    await update.message.reply_text(f"✅ Max file size set to *{MAX_FILE_SIZE_MB} MB*.", parse_mode="Markdown")
 
 
 async def setratelimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ You're not allowed to do this.")
         return
+    global RATE_LIMIT_SECONDS
     if not context.args:
         await update.message.reply_text("Usage: /setratelimit <seconds>")
         return
     try:
-        sec = float(context.args[0])
+        RATE_LIMIT_SECONDS = float(context.args[0])
     except ValueError:
         await update.message.reply_text("❌ That's not a valid number.")
         return
-    global RATE_LIMIT_SECONDS, rate_limiter
-    RATE_LIMIT_SECONDS = sec
-    await set_setting("rate_limit_seconds", str(sec))
-    rate_limiter.cooldown = sec
-    await update.message.reply_text(f"✅ Rate limit set to {sec:.0f} seconds.")
+    await set_setting("rate_limit_seconds", str(RATE_LIMIT_SECONDS))
+    if rate_limiter:
+        rate_limiter.cooldown = RATE_LIMIT_SECONDS
+    await update.message.reply_text(f"✅ Rate limit set to *{RATE_LIMIT_SECONDS:.0f} sec*.", parse_mode="Markdown")
 
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1328,199 +1258,243 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("⛔ You're not allowed to do this.")
         return
     text = (
-        "🛠️ *Admin commands*\n\n"
-        "/stats — today's stats\n"
-        "/users — top users\n"
-        "/ban <id> — ban a user\n"
-        "/unban <id> — unban a user\n"
-        "/banned — list banned users\n"
-        "/broadcast <msg> — message all users\n"
-        "/setcookies — upload cookies (reply to .txt)\n"
-        "/config — show configuration\n"
-        "/setadmin <id> — change admin ID\n"
-        "/setmaxsize <mb> — change max file size\n"
-        "/setratelimit <sec> — change rate limit\n"
-        "/ping — check if alive"
+        "🛠️ *Admin panel*\n\n"
+        "/stats — Today's stats\n"
+        "/users — Top users\n"
+        "/ban <id> — Ban a user\n"
+        "/unban <id> — Unban a user\n"
+        "/banned — List banned users\n"
+        "/broadcast <msg> — Message all users\n"
+        "/setcookies — Upload cookies (reply to a .txt file)\n"
+        "/config — Show configuration\n"
+        "/setadmin <id> — Change admin ID\n"
+        "/setmaxsize <mb> — Change max file size\n"
+        "/setratelimit <sec> — Change rate limit\n"
+        "/ping — Check if alive"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
 # ----------------------------------------------------------------------------
-# Cookie upload — reply to a .txt file with /setcookies (or send it directly).
+# Cookie upload — v3.3: works by REPLYING to a cookie .txt file with /setcookies
+# (or sending the .txt file directly to the admin chat).
 # ----------------------------------------------------------------------------
-async def _download_document_text(doc) -> str:
-    """Download an uploaded Telegram document and return its text content."""
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
-    tmp.close()
-    try:
-        await doc.get_file().download_to_drive(custom_path=tmp.name)
-        async with aiofiles.open(tmp.name, "r", encoding="utf-8", errors="replace") as fp:
-            return await fp.read()
-    finally:
-        try:
-            os.remove(tmp.name)
-        except OSError:
-            pass
+async def _save_cookie_file(platform: str, content: str) -> bool:
+    """Persist cookie content to its runtime file using aiofiles (non-blocking)."""
+    path = COOKIE_RUNTIME_FILES.get(platform)
+    if not path:
+        return False
+    async with aiofiles.open(path, "w", encoding="utf-8") as f:
+        await f.write(content)
+    return True
 
 
-async def _save_cookie_content(content: str, platform: str, filename: str) -> str:
-    """Write cookies to the runtime file and report expiry health."""
-    path = COOKIE_RUNTIME_FILES[platform]
-    async with aiofiles.open(path, "w", encoding="utf-8") as fp:
-        await fp.write(content)
-    exp = _cookie_earliest_expiry(content)
-    return (
-        f"✅ Saved *{platform.capitalize()}* cookies from `{filename}` "
-        f"({len(content)} bytes).\n"
-        f"🍪 Earliest expiry: {_describe_expiry(exp)}"
+def _count_cookie_entries(content: str) -> int:
+    return sum(
+        1 for line in content.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
     )
 
 
 async def setcookies_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Upload cookies by REPLYING to a cookie .txt file with /setcookies.
+
+    Usage:
+        /setcookies                              -> shows instructions
+        /setcookies  (reply to a .txt document)  -> download + detect + save
+        /setcookies  (reply to a text message)   -> save the text as cookies
+    """
     if not _is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ You're not allowed to do this.")
         return
+
     reply = update.message.reply_to_message
-    if reply is None or reply.document is None:
+
+    if reply is None:
         await update.message.reply_text(
-            "ℹ️ <b>How to upload cookies:</b>\n"
-            "1. Send the cookies <code>.txt</code> file here.\n"
-            "2. <b>Reply</b> to that file with <code>/setcookies</code>.\n\n"
-            "(Or just send the .txt file directly — I'll auto-detect it.)",
-            parse_mode="HTML",
+            "🍪 *Upload cookies*\n\n"
+            "Reply to a cookie `.txt` file (Netscape format) with `/setcookies`.\n\n"
+            "*How to:*\n"
+            "1. Export cookies from your browser as a `.txt` file.\n"
+            "2. Send that `.txt` file to me.\n"
+            "3. Reply to that file with `/setcookies`.\n\n"
+            "Supported: TikTok, Facebook.",
+            parse_mode="Markdown",
         )
         return
-    doc = reply.document
-    filename = doc.file_name or "cookies.txt"
-    if not filename.lower().endswith((".txt", ".cookies")):
-        await update.message.reply_text("⚠️ Please reply to a .txt cookies file.")
-        return
-    try:
-        content = await _download_document_text(doc)
-    except Exception as e:
-        await update.message.reply_text("❌ Could not download the file. Please try again.")
-        logger.error("Cookie download failed: %s", e)
+
+    content: str | None = None
+
+    if reply.document:
+        doc = reply.document
+        if doc.file_size and doc.file_size > 2 * 1024 * 1024:
+            await update.message.reply_text("❌ Cookie file too large (max 2 MB).")
+            return
+        status = await update.message.reply_text("⬇️ Downloading cookie file…")
+        try:
+            tg_file = await doc.get_file()
+            buf = await tg_file.download_as_bytearray()
+        except Exception as e:
+            await status.edit_text(f"❌ Couldn't download the file: {e}")
+            return
+        content = buf.decode("utf-8", errors="ignore")
+        await status.delete()
+    elif reply.text:
+        content = reply.text
+
+    if not content or not content.strip():
+        await update.message.reply_text("❌ I couldn't find cookie text in that message.")
         return
 
     platform = _detect_cookie_platform(content)
     if not platform:
         await update.message.reply_text(
-            "⚠️ That doesn't look like a TikTok or Facebook cookie file "
-            "(no matching domain entries found). Not saved — nothing changed."
-        )
-        return
-    result = await _save_cookie_content(content, platform, filename)
-    await update.message.reply_text(result, parse_mode="Markdown")
-
-
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Auto-detect a cookies .txt file sent directly to the admin."""
-    if not _is_admin(update.effective_user.id):
-        return
-    doc = update.message.document
-    if doc is None:
-        return
-    filename = doc.file_name or ""
-    if not filename.lower().endswith((".txt", ".cookies")):
-        return
-    try:
-        content = await _download_document_text(doc)
-    except Exception as e:
-        logger.error("Cookie download failed: %s", e)
-        return
-    platform = _detect_cookie_platform(content)
-    if not platform:
-        await update.message.reply_text(
-            "⚠️ That doesn't look like a TikTok or Facebook cookie file "
-            "(no matching domain entries found). Not saved — nothing changed."
-        )
-        return
-    result = await _save_cookie_content(content, platform, filename)
-    await update.message.reply_text(result, parse_mode="Markdown")
-
-
-# ----------------------------------------------------------------------------
-# Link handling
-# ----------------------------------------------------------------------------
-async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    if await is_banned(user_id):
-        await update.message.reply_text("🚫 You are banned from using this bot.")
-        return
-
-    await record_user(user_id, update.effective_user.username)
-
-    text = (update.message.text or "").strip()
-    platform, url = validate_url(text)
-    if not platform:
-        await update.message.reply_text(
-            "⚠️ Please send a valid <b>TikTok</b> or <b>Facebook</b> link.",
-            parse_mode="HTML",
+            "⚠️ That doesn't look like a TikTok or Facebook cookie "
+            "file (no matching domain entries found). Not saved — nothing changed."
         )
         return
 
-    if rate_limiter and not await rate_limiter.is_allowed(user_id):
-        rem = await rate_limiter.remaining(user_id)
-        await update.message.reply_text(
-            f"⏳ Please wait {rem:.0f} seconds before another request."
-        )
-        return
-
-    _pending[user_id] = {"url": url, "platform": platform}
+    await _save_cookie_file(platform, content)
+    exp = _cookie_earliest_expiry(content)
     await update.message.reply_text(
-        f"🎯 {PLATFORM_NAMES[platform]} link received.\nChoose a format:",
-        reply_markup=choice_keyboard(),
+        f"✅ Saved {PLATFORM_NAMES.get(platform, platform)} cookies.\n"
+        f"• Entries: `{_count_cookie_entries(content)}`\n"
+        f"• Expiry: {_describe_expiry(exp)}",
+        parse_mode="Markdown",
     )
 
 
+async def cookie_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Convenience: auto-save a cookie .txt file sent directly to the admin."""
+    if not _is_admin(update.effective_user.id):
+        return
+    doc = update.message.document
+    if not doc:
+        return
+    fname = (doc.file_name or "").lower()
+    if not fname.endswith(".txt"):
+        return
+    if doc.file_size and doc.file_size > 2 * 1024 * 1024:
+        await update.message.reply_text("❌ Cookie file too large (max 2 MB).")
+        return
+
+    status = await update.message.reply_text("⬇️ Reading cookie file…")
+    try:
+        tg_file = await doc.get_file()
+        buf = await tg_file.download_as_bytearray()
+    except Exception as e:
+        await status.edit_text(f"❌ Couldn't download the file: {e}")
+        return
+    content = buf.decode("utf-8", errors="ignore")
+
+    platform = _detect_cookie_platform(content)
+    if not platform:
+        await status.edit_text(
+            "⚠️ That doesn't look like a TikTok or Facebook cookie "
+            "file (no matching domain entries found). Not saved — nothing changed."
+        )
+        return
+
+    await _save_cookie_file(platform, content)
+    exp = _cookie_earliest_expiry(content)
+    await status.edit_text(
+        f"✅ Auto-saved {PLATFORM_NAMES.get(platform, platform)} cookies.\n"
+        f"• Entries: `{_count_cookie_entries(content)}`\n"
+        f"• Expiry: {_describe_expiry(exp)}",
+        parse_mode="Markdown",
+    )
+
+
+# ----------------------------------------------------------------------------
+# Main message handler — validates URL, applies rate limit, offers choice.
+# ----------------------------------------------------------------------------
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.text:
+        return
+    user = update.effective_user
+    await record_user(user.id, user.username)
+
+    if await is_banned(user.id):
+        await update.message.reply_text("🚫 You've been banned from using this bot.")
+        return
+
+    platform, url = validate_url(update.message.text)
+    if not platform:
+        # Not a supported link — stay silent (avoid noisy replies to casual chat).
+        return
+
+    if rate_limiter and not await rate_limiter.is_allowed(user.id):
+        remaining = await rate_limiter.remaining(user.id)
+        await update.message.reply_text(f"⏳ Slow down! Try again in {remaining:.0f}s.")
+        return
+
+    _pending[update.effective_chat.id] = {
+        "url": url,
+        "platform": platform,
+        "user_id": user.id,
+    }
+    await update.message.reply_text(
+        f"🔗 *{PLATFORM_NAMES.get(platform, 'video')} link received*\n\n"
+        "Choose a download format:",
+        reply_markup=choice_keyboard(),
+        parse_mode="Markdown",
+    )
+
+
+# ----------------------------------------------------------------------------
+# Callback handler — runs the actual download + upload with strict cleanup.
+# ----------------------------------------------------------------------------
 async def handle_format_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    user_id = query.from_user.id
+    chat_id = update.effective_chat.id
     data = query.data
 
     if data == "dl:cancel":
-        ev = _cancel_events.get(user_id)
-        if ev:
-            ev.set()
-        _pending.pop(user_id, None)
+        if chat_id in _cancel_events:
+            _cancel_events[chat_id].set()
+        _pending.pop(chat_id, None)
         try:
-            await query.edit_message_text("🚫 Download cancelled.")
+            await query.edit_message_text("🚫 Cancelled.")
         except Exception:
             pass
         return
 
-    if user_id not in _pending:
+    pending = _pending.pop(chat_id, None)
+    if not pending:
         try:
-            await query.edit_message_text("⚠️ Session expired. Send the link again.")
+            await query.edit_message_text("⚠️ This request has expired. Send the link again.")
         except Exception:
             pass
         return
 
-    pending = _pending.pop(user_id)
+    if data not in ("dl:video", "dl:audio"):
+        return
+
+    audio_only = data == "dl:audio"
     url = pending["url"]
     platform = pending["platform"]
-    audio_only = (data == "dl:audio")
+    user_id = pending["user_id"]
 
-    status_message = query.message
-    try:
-        await status_message.edit_text("⬇️ Starting download…", reply_markup=cancel_keyboard())
-    except Exception:
-        pass
-
+    # Unique temp dir for this download so parallel requests never collide.
+    work_dir = Path(tempfile.mkdtemp(prefix="dl_", dir=TEMP_DIR))
     cancel_event = threading.Event()
-    _cancel_events[user_id] = cancel_event
-    progress_state = {"status": "starting"}
-    stop_flag = {"done": False}
+    _cancel_events[chat_id] = cancel_event
+    progress_state = {"status": "starting", "downloaded": 0, "total": 0, "speed": 0, "eta": 0}
 
-    chat_id = query.message.chat_id
+    status_message = await query.edit_message_text(
+        "⬇️ Downloading…\n░░░░░░░░░░░░  0%",
+        reply_markup=cancel_keyboard(),
+    )
+
+    # Send the chat action immediately; the progress task keeps it alive.
     action = ChatAction.UPLOAD_VIDEO
-
     try:
         await context.bot.send_chat_action(chat_id=chat_id, action=action)
     except Exception:
         pass
 
+    stop_flag = {"done": False}
     progress_task = asyncio.create_task(
         run_progress_updates(
             status_message, progress_state, stop_flag,
@@ -1528,115 +1502,105 @@ async def handle_format_choice(update: Update, context: ContextTypes.DEFAULT_TYP
         )
     )
 
-    out_dir = tempfile.mkdtemp(prefix="dl_", dir=str(TEMP_DIR))
+    filepath = None
+    error = None
+
+    # --- Download (blocking yt-dlp runs in a worker thread) -----------------
     try:
-        # Blocking yt-dlp runs in a worker thread — never on the event loop.
-        filepath, error = await asyncio.to_thread(
-            download_with_retry,
-            url, platform, out_dir,
-            progress_state, cancel_event, audio_only,
-        )
-
-        if error and "cancel" in error.lower():
-            try:
-                await status_message.edit_text("🚫 Download cancelled.")
-            except Exception:
-                pass
-            return
-
-        if error:
-            friendly = _format_error(platform, error)
-            try:
-                await status_message.edit_text(friendly)
-            except Exception:
-                pass
-            await notify_admin(context, f"Download error ({platform}):\n{error[:1500]}")
-            return
-
-        if not filepath or not os.path.exists(filepath):
-            try:
-                await status_message.edit_text("❌ Could not find the downloaded file.")
-            except Exception:
-                pass
-            return
-
-        size_bytes = os.path.getsize(filepath)
-        if size_bytes > MAX_FILE_SIZE_MB * 1024 * 1024:
-            try:
-                await status_message.edit_text(
-                    f"📦 File is too large "
-                    f"({size_bytes / (1024 * 1024):.1f} MB > {MAX_FILE_SIZE_MB} MB)."
-                )
-            except Exception:
-                pass
-            return
-
         try:
-            await status_message.edit_text("📤 Uploading…")
-        except Exception:
-            pass
-
-        mtype = _media_type(filepath)
-        mode = "audio" if audio_only else mtype
-
-        # Pass the on-disk PATH (not bytes) so PTB streams the file — no OOM.
-        if mtype == "photo":
-            await context.bot.send_photo(
-                chat_id=chat_id, photo=filepath, caption=url,
-                reply_to_message_id=query.message.message_id,
+            filepath, error = await asyncio.wait_for(
+                asyncio.to_thread(
+                    download_with_retry,
+                    url, platform, str(work_dir), progress_state, cancel_event, audio_only,
+                ),
+                timeout=DOWNLOAD_TIMEOUT,
             )
-        elif mtype == "audio":
-            await context.bot.send_audio(
-                chat_id=chat_id, audio=filepath,
-                reply_to_message_id=query.message.message_id,
-            )
-        else:
-            await context.bot.send_video(
-                chat_id=chat_id, video=filepath, caption=url,
-                reply_to_message_id=query.message.message_id,
-                supports_streaming=True,
-            )
-
-        try:
-            await status_message.edit_text("✅ Done!")
-        except Exception:
-            pass
-
-        await record_download(user_id, platform, mode, size_bytes, True)
-
-    except Exception as e:
-        logger.error("Handler error for user %s: %s", user_id, e, exc_info=True)
-        await notify_admin(context, f"Handler error:\n{e}")
-        try:
-            await status_message.edit_text("❌ Something went wrong. Please try again.")
-        except Exception:
-            pass
+        except asyncio.TimeoutError:
+            error = "Download timed out."
+            cancel_event.set()
+        except Exception as e:
+            error = str(e)
+            cancel_event.set()
     finally:
         stop_flag["done"] = True
         if progress_task:
             progress_task.cancel()
-        _cancel_events.pop(user_id, None)
-        # STRICT TEMP CLEANUP (issue #3): always remove the whole download dir.
+        _cancel_events.pop(chat_id, None)
+
+    # --- Upload + report + cleanup (always runs, even on failure) -----------
+    try:
+        if error or not filepath or not os.path.exists(filepath):
+            await record_download(
+                user_id, platform, "audio" if audio_only else "video", 0, success=False
+            )
+            await status_message.edit_text(_format_error(platform, error), parse_mode="Markdown")
+            return
+
+        size_bytes = os.path.getsize(filepath)
+        size_mb = size_bytes / (1024 * 1024)
+        if size_mb > MAX_FILE_SIZE_MB:
+            await record_download(
+                user_id, platform, "audio" if audio_only else "video", size_bytes, success=False
+            )
+            await status_message.edit_text(
+                f"📦 This file is {size_mb:.1f} MB, over the {MAX_FILE_SIZE_MB} MB limit."
+            )
+            return
+
+        media = _media_type(filepath)
         try:
-            await asyncio.to_thread(shutil.rmtree, out_dir, True)
+            await status_message.edit_text("📤 Uploading to Telegram…")
+        except Exception:
+            pass
+
+        # Pass the on-disk *path* (str), never bytes — PTB streams from disk.
+        if media == "photo":
+            await context.bot.send_photo(chat_id=chat_id, photo=filepath)
+        elif media == "audio":
+            await context.bot.send_audio(chat_id=chat_id, audio=filepath)
+        else:
+            await context.bot.send_video(chat_id=chat_id, video=filepath)
+
+        try:
+            await status_message.delete()
+        except Exception:
+            pass
+        await record_download(
+            user_id, platform, "audio" if audio_only else "video", size_bytes, success=True
+        )
+    except Exception as e:
+        logger.exception("Upload failed")
+        await notify_admin(context, f"Upload failed for {url}\n\n{e}")
+        try:
+            await status_message.edit_text("❌ Upload to Telegram failed. Please try again.")
+        except Exception:
+            pass
+    finally:
+        # STRICT temp-file management (issue #3): always delete the dir.
+        try:
+            await asyncio.to_thread(shutil.rmtree, str(work_dir), True)
         except Exception:
             pass
 
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error("Unhandled error: %s", context.error, exc_info=True)
-    if ADMIN_ID:
-        await notify_admin(context, f"Unhandled error:\n{context.error}")
-
-
 # ----------------------------------------------------------------------------
-# Main
+# Error handler + entrypoint
 # ----------------------------------------------------------------------------
-async def main() -> None:
-    await init_db()
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Unhandled error: %s", context.error, exc_info=context.error)
+    await notify_admin(context, f"Unhandled exception:\n{context.error}")
 
-    application = Application.builder().token(BOT_TOKEN).build()
 
+def main() -> None:
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(lambda app: init_db())
+        .post_shutdown(lambda app: close_db())
+        .build()
+    )
+
+    # Commands
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("myid", myid_command))
@@ -1647,31 +1611,29 @@ async def main() -> None:
     application.add_handler(CommandHandler("unban", unban_command))
     application.add_handler(CommandHandler("banned", banned_command))
     application.add_handler(CommandHandler("broadcast", broadcast_command))
-    application.add_handler(CommandHandler("setcookies", setcookies_command))
     application.add_handler(CommandHandler("config", config_command))
     application.add_handler(CommandHandler("setadmin", setadmin_command))
     application.add_handler(CommandHandler("setmaxsize", setmaxsize_command))
     application.add_handler(CommandHandler("setratelimit", setratelimit_command))
     application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(CommandHandler("setcookies", setcookies_command))
 
-    application.add_handler(CallbackQueryHandler(handle_format_choice, pattern="^dl:"))
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+    # Callbacks
+    application.add_handler(CallbackQueryHandler(handle_format_choice, pattern=r"^dl:"))
+
+    # Cookie file direct-send convenience (admin only, checked inside handler).
+    application.add_handler(MessageHandler(filters.Document.ALL, cookie_file_handler))
+
+    # URL entry point
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+    )
 
     application.add_error_handler(error_handler)
 
-    try:
-        await application.initialize()
-        await application.start()
-        await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-        logger.info("Bot is running…")
-        # Run forever until the process is stopped.
-        await asyncio.Event().wait()
-    finally:
-        await application.stop()
-        await application.shutdown()
-        await close_db()
+    logger.info("Starting bot…")
+    application.run_polling()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
